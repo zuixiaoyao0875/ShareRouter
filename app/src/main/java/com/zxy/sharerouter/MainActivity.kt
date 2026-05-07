@@ -31,6 +31,7 @@ import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.graphics.ImageBitmap
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.PlatformTextStyle
@@ -39,6 +40,8 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.core.graphics.drawable.toBitmap
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
 import net.sourceforge.pinyin4j.PinyinHelper
 import sh.calvin.reorderable.ReorderableItem
 import sh.calvin.reorderable.rememberReorderableLazyGridState
@@ -46,7 +49,6 @@ import sh.calvin.reorderable.rememberReorderableLazyGridState
 data class AppTarget(
     val resolveInfo: ResolveInfo,
     val name: String,
-    val icon: Drawable,
     val packageName: String,
     val componentName: ComponentName,
     val isPinned: Boolean,
@@ -258,15 +260,26 @@ class MainActivity : ComponentActivity() {
             .filter { it.activityInfo.packageName != context.packageName }
             .map {
                 val componentName = ComponentName(it.activityInfo.packageName, it.activityInfo.name)
-                val label = it.loadLabel(context.packageManager).toString()
+                val compStr = componentName.flattenToString()
+                
+                val label = prefs.getString("label_$compStr", null) ?: run {
+                    val fetchedLabel = it.loadLabel(context.packageManager).toString()
+                    prefs.edit().putString("label_$compStr", fetchedLabel).apply()
+                    fetchedLabel
+                }
+                val pinyin = prefs.getString("pinyin_$compStr", null) ?: run {
+                    val fetchedPinyin = getPinyinPrefix(label)
+                    prefs.edit().putString("pinyin_$compStr", fetchedPinyin).apply()
+                    fetchedPinyin
+                }
+                
                 AppTarget(
                     resolveInfo = it,
                     name = label,
-                    icon = it.loadIcon(context.packageManager),
                     packageName = it.activityInfo.packageName,
                     componentName = componentName,
-                    isPinned = pinnedSet.contains(componentName.flattenToString()),
-                    pinyinPrefix = getPinyinPrefix(label)
+                    isPinned = pinnedSet.contains(compStr),
+                    pinyinPrefix = pinyin
                 )
             }.distinctBy { it.componentName.flattenToString() }
     }
@@ -297,15 +310,26 @@ class MainActivity : ComponentActivity() {
             .filter { it.activityInfo.packageName != packageName } // Exclude self
             .map {
                 val componentName = ComponentName(it.activityInfo.packageName, it.activityInfo.name)
-                val label = it.loadLabel(packageManager).toString()
+                val compStr = componentName.flattenToString()
+                
+                val label = prefs.getString("label_$compStr", null) ?: run {
+                    val fetchedLabel = it.loadLabel(packageManager).toString()
+                    prefs.edit().putString("label_$compStr", fetchedLabel).apply()
+                    fetchedLabel
+                }
+                val pinyin = prefs.getString("pinyin_$compStr", null) ?: run {
+                    val fetchedPinyin = getPinyinPrefix(label)
+                    prefs.edit().putString("pinyin_$compStr", fetchedPinyin).apply()
+                    fetchedPinyin
+                }
+                
                 AppTarget(
                     resolveInfo = it,
                     name = label,
-                    icon = it.loadIcon(packageManager),
                     packageName = it.activityInfo.packageName,
                     componentName = componentName,
-                    isPinned = pinnedSet.contains(componentName.flattenToString()),
-                    pinyinPrefix = getPinyinPrefix(label)
+                    isPinned = pinnedSet.contains(compStr),
+                    pinyinPrefix = pinyin
                 )
             }
             .filter { !hiddenSet.contains(it.componentName.flattenToString()) }
@@ -510,6 +534,15 @@ fun AppTargetGridItem(
     isDragging: Boolean = false,
     dragModifier: Modifier = Modifier
 ) {
+    val context = LocalContext.current
+    val packageManager = context.packageManager
+    
+    val iconBitmap by produceState<ImageBitmap?>(initialValue = null, target) {
+        value = withContext(Dispatchers.IO) {
+            target.resolveInfo.loadIcon(packageManager).toBitmap().asImageBitmap()
+        }
+    }
+    
     var showMenu by remember { mutableStateOf(false) }
 
     Box(
@@ -534,15 +567,25 @@ fun AppTargetGridItem(
             horizontalAlignment = Alignment.CenterHorizontally,
             modifier = Modifier.fillMaxWidth()
         ) {
-            val bitmap = remember(target.icon) { target.icon.toBitmap().asImageBitmap() }
-            Image(
-                bitmap = bitmap,
-                contentDescription = target.name,
-                modifier = Modifier
-                    .widthIn(max = 48.dp)
-                    .fillMaxWidth()
-                    .aspectRatio(1f)
-            )
+            if (iconBitmap != null) {
+                Image(
+                    bitmap = iconBitmap!!,
+                    contentDescription = target.name,
+                    modifier = Modifier
+                        .widthIn(max = 48.dp)
+                        .fillMaxWidth()
+                        .aspectRatio(1f)
+                )
+            } else {
+                Box(
+                    modifier = Modifier
+                        .widthIn(max = 48.dp)
+                        .fillMaxWidth()
+                        .aspectRatio(1f)
+                        .background(MaterialTheme.colorScheme.surfaceVariant, MaterialTheme.shapes.small)
+                )
+            }
+            
             if (showAppName) {
                 Spacer(modifier = Modifier.height(2.dp))
                 Text(
@@ -599,15 +642,12 @@ fun MainScreen(
     val context = LocalContext.current
     val mainActivity = context as MainActivity
 
-    // Load all apps and separate them
     val allApps = remember(pinnedSet) { mainActivity.getAllShareApps(context, pinnedSet) }
     
-    // Hidden apps
     val hiddenApps = remember(allApps, hiddenSet) {
         allApps.filter { hiddenSet.contains(it.componentName.flattenToString()) }.sortedBy { it.name }
     }
 
-    // Pinned apps (sorted by pinnedOrder)
     var mutablePinnedApps by remember(allApps, pinnedSet, pinnedOrder, hiddenSet) {
         mutableStateOf(
             allApps.filter { it.isPinned && !hiddenSet.contains(it.componentName.flattenToString()) }
@@ -621,7 +661,6 @@ fun MainScreen(
         )
     }
 
-    // Normal apps (sorted intelligently by last used and frequency)
     val normalApps = remember(allApps, pinnedSet, hiddenSet) {
         val prefs = mainActivity.getSharedPreferences("ShareRouterPrefs", Context.MODE_PRIVATE)
         val lastUsedApp = prefs.getString("last_used_app", "") ?: ""
@@ -693,9 +732,9 @@ fun MainScreen(
                             target = app,
                             showAppName = showAppName,
                             fontSize = fontSize,
-                            showMenuEnabled = false, // Disable drop down menu
+                            showMenuEnabled = false,
                             isDragging = isDragging,
-                            dragModifier = Modifier.longPressDraggableHandle() // Use long press to start drag
+                            dragModifier = Modifier.longPressDraggableHandle()
                         )
                     }
                 }
@@ -731,21 +770,35 @@ fun MainScreen(
                         modifier = Modifier.padding(vertical = 12.dp)
                     )
                 }
-                // Hidden apps are rendered simply without reorder handle
                 items(hiddenApps, key = { "hidden_" + it.componentName.flattenToString() }) { app ->
+                    val packageManager = context.packageManager
+                    val iconBitmap by produceState<ImageBitmap?>(initialValue = null, app) {
+                        value = withContext(Dispatchers.IO) {
+                            app.resolveInfo.loadIcon(packageManager).toBitmap().asImageBitmap()
+                        }
+                    }
                     Column(
                         horizontalAlignment = Alignment.CenterHorizontally,
                         modifier = Modifier.fillMaxWidth().padding(vertical = 0.dp, horizontal = 2.dp)
                     ) {
-                        val bitmap = remember(app.icon) { app.icon.toBitmap().asImageBitmap() }
-                        Image(
-                            bitmap = bitmap, 
-                            contentDescription = app.name, 
-                            modifier = Modifier
-                                .widthIn(max = 48.dp)
-                                .fillMaxWidth()
-                                .aspectRatio(1f)
-                        )
+                        if (iconBitmap != null) {
+                            Image(
+                                bitmap = iconBitmap!!, 
+                                contentDescription = app.name, 
+                                modifier = Modifier
+                                    .widthIn(max = 48.dp)
+                                    .fillMaxWidth()
+                                    .aspectRatio(1f)
+                            )
+                        } else {
+                            Box(
+                                modifier = Modifier
+                                    .widthIn(max = 48.dp)
+                                    .fillMaxWidth()
+                                    .aspectRatio(1f)
+                                    .background(MaterialTheme.colorScheme.surfaceVariant, MaterialTheme.shapes.small)
+                            )
+                        }
                         if (showAppName) {
                             Spacer(modifier = Modifier.height(2.dp))
                             Text(
