@@ -5,8 +5,6 @@ import android.content.Context
 import android.content.Intent
 import android.content.SharedPreferences
 import android.content.pm.PackageManager
-import android.content.pm.ResolveInfo
-import android.graphics.drawable.Drawable
 import android.os.Build
 import android.os.Bundle
 import android.widget.Toast
@@ -43,11 +41,12 @@ import androidx.core.graphics.drawable.toBitmap
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import net.sourceforge.pinyin4j.PinyinHelper
+import org.json.JSONArray
+import org.json.JSONObject
 import sh.calvin.reorderable.ReorderableItem
 import sh.calvin.reorderable.rememberReorderableLazyGridState
 
 data class AppTarget(
-    val resolveInfo: ResolveInfo,
     val name: String,
     val packageName: String,
     val componentName: ComponentName,
@@ -85,13 +84,40 @@ class MainActivity : ComponentActivity() {
                     
                     var isTempUnhideEnabled by remember { mutableStateOf(false) }
 
-                    val targetApps = remember(pinnedSet, hiddenSet, pinnedOrder, isTempUnhideEnabled) {
-                        queryTargetApps(
-                            shareIntent = intent, 
-                            pinnedSet = pinnedSet, 
-                            hiddenSet = if (isTempUnhideEnabled) emptySet() else hiddenSet,
-                            pinnedOrder = pinnedOrder
-                        )
+                    // 1. Initial State: Load from JSON cache IMMEDIATELY (Synchronously)
+                    // This ensures the first frame already contains the app list, avoiding flickers.
+                    var targetApps by remember(pinnedSet, hiddenSet, pinnedOrder, isTempUnhideEnabled) {
+                        val startTime = System.currentTimeMillis()
+                        val cached = getCachedTargets()
+                        val initial = if (cached != null) {
+                            sortTargets(cached, pinnedSet, hiddenSet, pinnedOrder, isTempUnhideEnabled)
+                        } else {
+                            emptyList()
+                        }
+                        android.util.Log.d("ShareRouter", "Cache load took ${System.currentTimeMillis() - startTime}ms, size: ${initial.size}")
+                        mutableStateOf(initial)
+                    }
+
+                    // 2. Background silent sync (Only for refreshing the system list)
+                    LaunchedEffect(Unit) {
+                        withContext(Dispatchers.IO) {
+                            val startTime = System.currentTimeMillis()
+                            val realApps = fetchSystemTargets()
+                            android.util.Log.d("ShareRouter", "System scan took ${System.currentTimeMillis() - startTime}ms")
+                            
+                            val realCompStr = realApps.map { it.componentName.flattenToString() }.toSet()
+                            val cachedCompStr = targetApps.map { it.componentName.flattenToString() }.toSet()
+                            
+                            // If the installed apps changed (added or removed)
+                            if (realCompStr != cachedCompStr) {
+                                android.util.Log.d("ShareRouter", "System targets changed, updating cache...")
+                                saveTargetsToCache(realApps)
+                                val sorted = sortTargets(realApps, pinnedSet, hiddenSet, pinnedOrder, isTempUnhideEnabled)
+                                withContext(Dispatchers.Main) {
+                                    targetApps = sorted
+                                }
+                            }
+                        }
                     }
 
                     if (showBottomSheet) {
@@ -247,64 +273,54 @@ class MainActivity : ComponentActivity() {
         return builder.toString().lowercase()
     }
 
-    fun getAllShareApps(context: Context, pinnedSet: Set<String>): List<AppTarget> {
-        val shareIntent = Intent(Intent.ACTION_SEND).apply { type = "*/*" }
-        val resolveInfos = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-            context.packageManager.queryIntentActivities(shareIntent, PackageManager.ResolveInfoFlags.of(0))
-        } else {
-            @Suppress("DEPRECATION")
-            context.packageManager.queryIntentActivities(shareIntent, 0)
-        }
-        
-        return resolveInfos
-            .filter { it.activityInfo.packageName != context.packageName }
-            .map {
-                val componentName = ComponentName(it.activityInfo.packageName, it.activityInfo.name)
-                val compStr = componentName.flattenToString()
-                
-                val label = prefs.getString("label_$compStr", null) ?: run {
-                    val fetchedLabel = it.loadLabel(context.packageManager).toString()
-                    prefs.edit().putString("label_$compStr", fetchedLabel).apply()
-                    fetchedLabel
-                }
-                val pinyin = prefs.getString("pinyin_$compStr", null) ?: run {
-                    val fetchedPinyin = getPinyinPrefix(label)
-                    prefs.edit().putString("pinyin_$compStr", fetchedPinyin).apply()
-                    fetchedPinyin
-                }
-                
-                AppTarget(
-                    resolveInfo = it,
-                    name = label,
-                    packageName = it.activityInfo.packageName,
-                    componentName = componentName,
-                    isPinned = pinnedSet.contains(compStr),
-                    pinyinPrefix = pinyin
+    fun getCachedTargets(): List<AppTarget>? {
+        val jsonStr = prefs.getString("cached_targets_json", null) ?: return null
+        return try {
+            val jsonArray = JSONArray(jsonStr)
+            val list = mutableListOf<AppTarget>()
+            for (i in 0 until jsonArray.length()) {
+                val obj = jsonArray.getJSONObject(i)
+                val compStr = obj.getString("comp")
+                val comp = ComponentName.unflattenFromString(compStr) ?: continue
+                list.add(
+                    AppTarget(
+                        name = obj.getString("name"),
+                        packageName = comp.packageName,
+                        componentName = comp,
+                        isPinned = false, // Will be overridden
+                        pinyinPrefix = obj.getString("pinyin")
+                    )
                 )
-            }.distinctBy { it.componentName.flattenToString() }
+            }
+            list
+        } catch (e: Exception) {
+            null
+        }
     }
 
-    private fun queryTargetApps(
-        shareIntent: Intent, 
-        pinnedSet: Set<String>, 
-        hiddenSet: Set<String>,
-        pinnedOrder: List<String>
-    ): List<AppTarget> {
-        val queryIntent = Intent(shareIntent.action).apply {
-            type = shareIntent.type
+    fun saveTargetsToCache(targets: List<AppTarget>) {
+        val jsonArray = JSONArray()
+        for (target in targets) {
+            val obj = JSONObject()
+            obj.put("comp", target.componentName.flattenToString())
+            obj.put("name", target.name)
+            obj.put("pinyin", target.pinyinPrefix)
+            jsonArray.put(obj)
         }
+        prefs.edit().putString("cached_targets_json", jsonArray.toString()).apply()
+    }
 
+    fun fetchSystemTargets(): List<AppTarget> {
+        val shareIntent = Intent(Intent.ACTION_SEND).apply { type = "*/*" }
         val resolveInfos = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
             packageManager.queryIntentActivities(
-                queryIntent,
+                shareIntent,
                 PackageManager.ResolveInfoFlags.of(PackageManager.MATCH_DEFAULT_ONLY.toLong())
             )
         } else {
             @Suppress("DEPRECATION")
-            packageManager.queryIntentActivities(queryIntent, PackageManager.MATCH_DEFAULT_ONLY)
+            packageManager.queryIntentActivities(shareIntent, PackageManager.MATCH_DEFAULT_ONLY)
         }
-
-        val lastUsedApp = prefs.getString("last_used_app", "") ?: ""
 
         return resolveInfos
             .filter { it.activityInfo.packageName != packageName } // Exclude self
@@ -324,15 +340,29 @@ class MainActivity : ComponentActivity() {
                 }
                 
                 AppTarget(
-                    resolveInfo = it,
                     name = label,
                     packageName = it.activityInfo.packageName,
                     componentName = componentName,
-                    isPinned = pinnedSet.contains(compStr),
+                    isPinned = false,
                     pinyinPrefix = pinyin
                 )
             }
-            .filter { !hiddenSet.contains(it.componentName.flattenToString()) }
+            .distinctBy { it.componentName.flattenToString() }
+    }
+
+    private fun sortTargets(
+        rawApps: List<AppTarget>,
+        pinnedSet: Set<String>, 
+        hiddenSet: Set<String>,
+        pinnedOrder: List<String>,
+        isTempUnhideEnabled: Boolean
+    ): List<AppTarget> {
+        val lastUsedApp = prefs.getString("last_used_app", "") ?: ""
+        val effectiveHiddenSet = if (isTempUnhideEnabled) emptySet() else hiddenSet
+
+        return rawApps
+            .map { it.copy(isPinned = pinnedSet.contains(it.componentName.flattenToString())) }
+            .filter { !effectiveHiddenSet.contains(it.componentName.flattenToString()) }
             .sortedWith { a, b ->
                 val aComp = a.componentName.flattenToString()
                 val bComp = b.componentName.flattenToString()
@@ -539,7 +569,11 @@ fun AppTargetGridItem(
     
     val iconBitmap by produceState<ImageBitmap?>(initialValue = null, target) {
         value = withContext(Dispatchers.IO) {
-            target.resolveInfo.loadIcon(packageManager).toBitmap().asImageBitmap()
+            try {
+                packageManager.getActivityIcon(target.componentName).toBitmap().asImageBitmap()
+            } catch (e: Exception) {
+                null
+            }
         }
     }
     
@@ -642,15 +676,39 @@ fun MainScreen(
     val context = LocalContext.current
     val mainActivity = context as MainActivity
 
-    val allApps = remember(pinnedSet) { mainActivity.getAllShareApps(context, pinnedSet) }
-    
-    val hiddenApps = remember(allApps, hiddenSet) {
-        allApps.filter { hiddenSet.contains(it.componentName.flattenToString()) }.sortedBy { it.name }
+    // 1. Synchronous cache load for the settings screen
+    var rawApps by remember {
+        val cached = mainActivity.getCachedTargets()
+        mutableStateOf(cached ?: emptyList())
     }
 
-    var mutablePinnedApps by remember(allApps, pinnedSet, pinnedOrder, hiddenSet) {
+    // 2. Background sync
+    LaunchedEffect(Unit) {
+        withContext(Dispatchers.IO) {
+            val realApps = mainActivity.fetchSystemTargets()
+            val realCompStr = realApps.map { it.componentName.flattenToString() }.toSet()
+            val cachedCompStr = rawApps.map { it.componentName.flattenToString() }.toSet()
+            
+            if (realCompStr != cachedCompStr) {
+                mainActivity.saveTargetsToCache(realApps)
+                withContext(Dispatchers.Main) {
+                    rawApps = realApps
+                }
+            }
+        }
+    }
+
+    val appsWithPinState = remember(rawApps, pinnedSet) {
+        rawApps.map { it.copy(isPinned = pinnedSet.contains(it.componentName.flattenToString())) }
+    }
+
+    val hiddenApps = remember(appsWithPinState, hiddenSet) {
+        appsWithPinState.filter { hiddenSet.contains(it.componentName.flattenToString()) }.sortedBy { it.name }
+    }
+
+    var mutablePinnedApps by remember(appsWithPinState, pinnedSet, pinnedOrder, hiddenSet) {
         mutableStateOf(
-            allApps.filter { it.isPinned && !hiddenSet.contains(it.componentName.flattenToString()) }
+            appsWithPinState.filter { it.isPinned && !hiddenSet.contains(it.componentName.flattenToString()) }
                    .sortedWith { a, b ->
                        val aComp = a.componentName.flattenToString()
                        val bComp = b.componentName.flattenToString()
@@ -661,11 +719,11 @@ fun MainScreen(
         )
     }
 
-    val normalApps = remember(allApps, pinnedSet, hiddenSet) {
+    val normalApps = remember(appsWithPinState, pinnedSet, hiddenSet) {
         val prefs = mainActivity.getSharedPreferences("ShareRouterPrefs", Context.MODE_PRIVATE)
         val lastUsedApp = prefs.getString("last_used_app", "") ?: ""
         
-        allApps.filter { !it.isPinned && !hiddenSet.contains(it.componentName.flattenToString()) }
+        appsWithPinState.filter { !it.isPinned && !hiddenSet.contains(it.componentName.flattenToString()) }
                .sortedWith { a, b ->
                    val aComp = a.componentName.flattenToString()
                    val bComp = b.componentName.flattenToString()
@@ -774,7 +832,11 @@ fun MainScreen(
                     val packageManager = context.packageManager
                     val iconBitmap by produceState<ImageBitmap?>(initialValue = null, app) {
                         value = withContext(Dispatchers.IO) {
-                            app.resolveInfo.loadIcon(packageManager).toBitmap().asImageBitmap()
+                            try {
+                                packageManager.getActivityIcon(app.componentName).toBitmap().asImageBitmap()
+                            } catch (e: Exception) {
+                                null
+                            }
                         }
                     }
                     Column(
