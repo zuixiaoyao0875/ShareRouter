@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<paths>
+    <!-- 为分享历史提供影印文件访问 -->
+    <external-files-path
+        name="share_history"
+        path="share_history/" />
+</paths>

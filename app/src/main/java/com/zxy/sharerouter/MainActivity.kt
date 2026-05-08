@@ -25,12 +25,18 @@ import androidx.compose.foundation.lazy.grid.GridItemSpan
 import androidx.compose.foundation.lazy.grid.LazyVerticalGrid
 import androidx.compose.foundation.lazy.grid.items
 import androidx.compose.foundation.lazy.grid.rememberLazyGridState
+import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.items as lazyItems
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material.icons.filled.Search
 import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material.icons.filled.Share
 import androidx.compose.material.icons.filled.Add
+import androidx.compose.material.icons.filled.Menu
+import androidx.compose.material.icons.filled.List
+import androidx.compose.material.icons.filled.Visibility
+import androidx.compose.material.icons.filled.VisibilityOff
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
@@ -72,6 +78,12 @@ data class AppTarget(
     val pinyinPrefix: String
 )
 
+fun Context.findActivity(): ComponentActivity? = when (this) {
+    is ComponentActivity -> this
+    is ContextWrapper -> baseContext.findActivity()
+    else -> null
+}
+
 @OptIn(ExperimentalMaterial3Api::class)
 class MainActivity : ComponentActivity() {
 
@@ -82,9 +94,6 @@ class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         
-        // 1. 立即显示 XML 骨架屏，抢占冷启动首帧
-        setContentView(R.layout.skeleton_main)
-        
         prefs = getSharedPreferences("ShareRouterPrefs", Context.MODE_PRIVATE)
 
         // 异步初始化图标缓存目录
@@ -94,139 +103,264 @@ class MainActivity : ComponentActivity() {
         val action = intent.action
         val isShareIntent = action == Intent.ACTION_SEND || action == Intent.ACTION_SEND_MULTIPLE
 
-        // 稍微延迟 Compose 的挂载，确保 XML 骨架屏至少渲染一帧，消除 Compose 初始化时的瞬时白屏
-        window.decorView.post {
-            setContent {
-                MaterialTheme(
-                    colorScheme = if (isSystemInDarkTheme()) darkColorScheme(surface = Color(0xFF1C1B1F)) else lightColorScheme()
+        setContent {
+            MaterialTheme(
+                colorScheme = if (isSystemInDarkTheme()) darkColorScheme(surface = Color(0xFF1C1B1F)) else lightColorScheme()
+            ) {
+                Surface(
+                    modifier = Modifier.fillMaxSize(),
+                    color = MaterialTheme.colorScheme.surface
                 ) {
-                    Surface(
-                        modifier = Modifier.fillMaxSize(),
-                        color = MaterialTheme.colorScheme.surface
-                    ) {
-                        var pinnedSet by remember { mutableStateOf(getPinnedComponents()) }
-                        var hiddenSet by remember { mutableStateOf(getHiddenComponents()) }
-                        var pinnedOrder by remember { mutableStateOf(getPinnedOrder()) }
+                    val scope = rememberCoroutineScope()
+                    var pinnedSet by remember { mutableStateOf(getPinnedComponents()) }
+                    var hiddenSet by remember { mutableStateOf(getHiddenComponents()) }
+                    var pinnedOrder by remember { mutableStateOf(getPinnedOrder()) }
 
-                        var columnCount by remember { mutableStateOf(getColumnCount()) }
-                        var showAppName by remember { mutableStateOf(getShowAppName()) }
-                        var fontSize by remember { mutableStateOf(getFontSize()) }
-                        var lineSpacing by remember { mutableStateOf(getLineSpacing()) }
+                    var columnCount by remember { mutableStateOf(getColumnCount()) }
+                    var showAppName by remember { mutableStateOf(getShowAppName()) }
+                    var fontSize by remember { mutableStateOf(getFontSize()) }
+                    var lineSpacing by remember { mutableStateOf(getLineSpacing()) }
+                    var historyLimit by remember { mutableStateOf(getHistoryLimit()) }
+                    val historyManager = remember { HistoryManager(this@MainActivity) }
+                    var currentTab by remember { mutableStateOf(1) } // 0: Settings, 1: History
+                    var showSettingsSheet by remember { mutableStateOf(false) }
+                    var rawApps by remember { mutableStateOf<List<AppTarget>>(emptyList()) }
+                    var isRefreshing by remember { mutableStateOf(false) }
 
-                        val onConfigImported = { newOrder: List<String>, newHidden: Set<String> ->
-                            pinnedOrder = newOrder
-                            hiddenSet = newHidden
-                            pinnedSet = newOrder.toSet()
+                    val refreshApps = {
+                        isRefreshing = true
+                        scope.launch(Dispatchers.IO) {
+                            clearPinyinCache()
+                            val realApps = fetchSystemTargets()
+                            saveTargetsToCache(realApps)
+                            withContext(Dispatchers.Main) {
+                                rawApps = realApps
+                                isRefreshing = false
+                                Toast.makeText(this@MainActivity, "列表已刷新", Toast.LENGTH_SHORT).show()
+                            }
+                        }
+                    }
+
+                    LaunchedEffect(Unit) {
+                        if (!isShareIntent) {
+                            withContext(Dispatchers.IO) {
+                                rawApps = fetchSystemTargets()
+                            }
+                        }
+                    }
+
+                    val onConfigImported = { newOrder: List<String>, newHidden: Set<String> ->
+                        pinnedOrder = newOrder
+                        hiddenSet = newHidden
+                        pinnedSet = newOrder.toSet()
+                    }
+
+                    if (isShareIntent) {
+                        // ... (isShareIntent logic remains unchanged)
+                        var showBottomSheet by remember { mutableStateOf(true) }
+                        val sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = false)
+                        var isTempUnhideEnabled by remember { mutableStateOf(false) }
+                        var isFirstLoad by remember { mutableStateOf(true) }
+
+                        LaunchedEffect(intent) {
+                            val referrer = getReferrer()?.host ?: intent.getStringExtra(Intent.EXTRA_REFERRER_NAME)
+                            historyManager.cloneAndSave(intent, historyLimit, referrer)
                         }
 
-                        if (isShareIntent) {
-                            var showBottomSheet by remember { mutableStateOf(true) }
-                            val sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = false)
-                            var isTempUnhideEnabled by remember { mutableStateOf(false) }
-                            var isFirstLoad by remember { mutableStateOf(true) }
+                        // 1. 【极致优化】分阶段加载
+                        val targetApps by produceState<List<AppTarget>>(
+                            initialValue = if (isFirstLoad) {
+                                getCachedTargets()?.let { cached ->
+                                    val lastUsed = prefs.getString("last_used_app", "") ?: ""
+                                    cached.filter { 
+                                        pinnedSet.contains(it.componentName.flattenToString()) || 
+                                        it.componentName.flattenToString() == lastUsed 
+                                    }.let { sortTargets(it, pinnedSet, hiddenSet, pinnedOrder, isTempUnhideEnabled) }
+                                } ?: emptyList()
+                            } else emptyList(),
+                            pinnedSet, hiddenSet, pinnedOrder, isTempUnhideEnabled
+                        ) {
+                            value = withContext(Dispatchers.IO) {
+                                val filtered = fetchSystemTargets(intent)
+                                val sorted = sortTargets(filtered, pinnedSet, hiddenSet, pinnedOrder, isTempUnhideEnabled)
+                                
+                                if (isFirstLoad) {
+                                    val lastUsed = prefs.getString("last_used_app", "") ?: ""
+                                    val minimal = sorted.filter { 
+                                        pinnedSet.contains(it.componentName.flattenToString()) || 
+                                        it.componentName.flattenToString() == lastUsed 
+                                    }
+                                    withContext(Dispatchers.Main) {
+                                        value = minimal
+                                    }
+                                    delay(450) 
+                                    withContext(Dispatchers.Main) {
+                                        value = sorted.take(30)
+                                    }
+                                    delay(800)
+                                    isFirstLoad = false
+                                    sorted
+                                } else {
+                                    sorted
+                                }
+                            }
+                        }
 
-                            // 1. 【极致优化】分阶段加载：冷启动阶梯式载入，热更新（隐藏/置顶）瞬间响应
-                            val targetApps by produceState<List<AppTarget>>(
-                                initialValue = if (isFirstLoad) {
-                                    getCachedTargets()?.let { cached ->
-                                        val lastUsed = prefs.getString("last_used_app", "") ?: ""
-                                        cached.filter { 
-                                            pinnedSet.contains(it.componentName.flattenToString()) || 
-                                            it.componentName.flattenToString() == lastUsed 
-                                        }.let { sortTargets(it, pinnedSet, hiddenSet, pinnedOrder, isTempUnhideEnabled) }
-                                    } ?: emptyList()
-                                } else emptyList(),
-                                pinnedSet, hiddenSet, pinnedOrder, isTempUnhideEnabled
+                        LaunchedEffect(Unit) {
+                            withContext(Dispatchers.IO) {
+                                delay(1500)
+                                val realFullApps = fetchSystemTargets(null)
+                                saveTargetsToCache(realFullApps)
+                            }
+                        }
+
+                        if (showBottomSheet) {
+                            ModalBottomSheet(
+                                onDismissRequest = {
+                                    showBottomSheet = false
+                                    finish()
+                                },
+                                sheetState = sheetState,
+                                containerColor = MaterialTheme.colorScheme.surface,
+                                dragHandle = {
+                                    Box(
+                                        modifier = Modifier
+                                            .padding(top = 10.dp, bottom = 4.dp)
+                                            .width(32.dp)
+                                            .height(4.dp)
+                                            .background(MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.4f), MaterialTheme.shapes.extraLarge)
+                                    )
+                                }
                             ) {
-                                value = withContext(Dispatchers.IO) {
-                                    // 2. 后台获取精准过滤的全量列表
-                                    val filtered = fetchSystemTargets(intent)
-                                    val sorted = sortTargets(filtered, pinnedSet, hiddenSet, pinnedOrder, isTempUnhideEnabled)
-                                    
-                                    if (isFirstLoad) {
-                                        // 首次加载路径：阶梯式注入，平滑首帧
-                                        val lastUsed = prefs.getString("last_used_app", "") ?: ""
-                                        val minimal = sorted.filter { 
-                                            pinnedSet.contains(it.componentName.flattenToString()) || 
-                                            it.componentName.flattenToString() == lastUsed 
-                                        }
-                                        withContext(Dispatchers.Main) {
-                                            value = minimal
-                                        }
-                                        
-                                        delay(450) 
-                                        withContext(Dispatchers.Main) {
-                                            value = sorted.take(30)
-                                        }
-                                        
-                                        delay(800)
-                                        android.util.Log.d("ShareRouter", "Staged loading completed.")
-                                        isFirstLoad = false // 之后的所有操作都进入快车道
-                                        sorted
-                                    } else {
-                                        // 热更新路径：无延迟即时加载
-                                        sorted
-                                    }
-                                }
-                            }
-
-                            // 2. 背景同步：避开启动峰值更新缓存
-                            LaunchedEffect(Unit) {
-                                withContext(Dispatchers.IO) {
-                                    delay(1500)
-                                    val realFullApps = fetchSystemTargets(null)
-                                    saveTargetsToCache(realFullApps)
-                                }
-                            }
-
-                            if (showBottomSheet) {
-                                ModalBottomSheet(
-                                    onDismissRequest = {
-                                        showBottomSheet = false
-                                        finish()
+                                ShareTargetScreen(
+                                    targets = targetApps,
+                                    pinnedSet = pinnedSet,
+                                    pinnedOrder = pinnedOrder,
+                                    hiddenSet = hiddenSet,
+                                    columnCount = columnCount,
+                                    showAppName = showAppName,
+                                    fontSize = fontSize,
+                                    lineSpacing = lineSpacing,
+                                    isTempUnhideEnabled = isTempUnhideEnabled,
+                                    onColumnCountChange = { c -> 
+                                        columnCount = c
+                                        saveColumnCount(c) 
                                     },
-                                    sheetState = sheetState,
-                                    containerColor = MaterialTheme.colorScheme.surface,
-                                    dragHandle = {
-                                        Box(
-                                            modifier = Modifier
-                                                .padding(top = 10.dp, bottom = 4.dp)
-                                                .width(32.dp)
-                                                .height(4.dp)
-                                                .background(MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.4f), MaterialTheme.shapes.extraLarge)
-                                        )
-                                    }
-                                ) {
-                                    ShareTargetScreen(
-                                        targets = targetApps,
+                                    onShowAppNameChange = { s -> 
+                                        showAppName = s
+                                        saveShowAppName(s) 
+                                    },
+                                    onFontSizeChange = { f ->
+                                        fontSize = f
+                                        saveFontSize(f)
+                                    },
+                                    onLineSpacingChange = { s ->
+                                        lineSpacing = s
+                                        saveLineSpacing(s)
+                                    },
+                                    onTempUnhideToggle = { 
+                                        isTempUnhideEnabled = !isTempUnhideEnabled 
+                                    },
+                                    onTargetClick = { target -> forwardIntent(intent, target) },
+                                    onPinToggle = { target ->
+                                        val compStr = target.componentName.flattenToString()
+                                        val newPinned = pinnedSet.toMutableSet()
+                                        val newOrder = pinnedOrder.toMutableList()
+                                        if (newPinned.contains(compStr)) {
+                                            newPinned.remove(compStr)
+                                            newOrder.remove(compStr)
+                                        } else {
+                                            newPinned.add(compStr)
+                                            if (!newOrder.contains(compStr)) newOrder.add(compStr)
+                                        }
+                                        savePinnedComponents(newPinned)
+                                        savePinnedOrder(newOrder)
+                                        pinnedSet = newPinned
+                                        pinnedOrder = newOrder
+                                    },
+                                    onHide = { target ->
+                                        val compStr = target.componentName.flattenToString()
+                                        val newHidden = hiddenSet.toMutableSet()
+                                        newHidden.add(compStr)
+                                        saveHiddenComponents(newHidden)
+                                        hiddenSet = newHidden
+                                    },
+                                    onConfigImported = onConfigImported
+                                )
+                            }
+                        }
+                    } else {
+                        Scaffold(
+                            modifier = Modifier.statusBarsPadding(),
+                            topBar = {
+                                TopAppBar(
+                                    title = { 
+                                        Text("ShareRouter 设置", fontSize = 18.sp) 
+                                    },
+                                    actions = {
+                                        IconButton(onClick = { 
+                                            if (currentTab == 1) {
+                                                Toast.makeText(this@MainActivity, "已刷新分享历史", Toast.LENGTH_SHORT).show()
+                                            } else {
+                                                refreshApps() 
+                                            }
+                                        }) {
+                                            Icon(Icons.Default.Refresh, contentDescription = "刷新")
+                                        }
+                                        IconButton(onClick = { showSettingsSheet = true }) {
+                                            Icon(Icons.Default.Settings, contentDescription = "设置")
+                                        }
+                                    },
+                                    colors = TopAppBarDefaults.topAppBarColors(
+                                        containerColor = Color.Transparent,
+                                        titleContentColor = MaterialTheme.colorScheme.onSurface
+                                    )
+                                )
+                            },
+                            bottomBar = {
+                                NavigationBar {
+                                    NavigationBarItem(
+                                        selected = currentTab == 1,
+                                        onClick = { currentTab = 1 },
+                                        icon = { Icon(Icons.Default.List, contentDescription = null) },
+                                        label = { Text("分享历史") }
+                                    )
+                                    NavigationBarItem(
+                                        selected = currentTab == 0,
+                                        onClick = { currentTab = 0 },
+                                        icon = { Icon(Icons.Default.Settings, contentDescription = null) },
+                                        label = { Text("配置管理") }
+                                    )
+                                }
+                            }
+                        ) { paddingValues ->
+                            Column(modifier = Modifier.padding(paddingValues)) {
+                                if (currentTab == 0) {
+                                    MainScreen(
+                                        rawApps = rawApps,
+                                        hiddenSet = hiddenSet,
                                         pinnedSet = pinnedSet,
                                         pinnedOrder = pinnedOrder,
-                                        hiddenSet = hiddenSet,
                                         columnCount = columnCount,
                                         showAppName = showAppName,
                                         fontSize = fontSize,
                                         lineSpacing = lineSpacing,
-                                        isTempUnhideEnabled = isTempUnhideEnabled,
-                                        onColumnCountChange = { c -> 
-                                            columnCount = c
-                                            saveColumnCount(c) 
+                                        historyLimit = historyLimit,
+                                        onUnhide = { compStr ->
+                                            val newHidden = hiddenSet.toMutableSet()
+                                            newHidden.remove(compStr)
+                                            saveHiddenComponents(newHidden)
+                                            hiddenSet = newHidden
                                         },
-                                        onShowAppNameChange = { s -> 
-                                            showAppName = s
-                                            saveShowAppName(s) 
+                                        onPinnedOrderChange = { newList ->
+                                            savePinnedOrder(newList)
+                                            pinnedOrder = newList
                                         },
-                                        onFontSizeChange = { f ->
-                                            fontSize = f
-                                            saveFontSize(f)
+                                        onConfigImported = onConfigImported,
+                                        onHistoryLimitChange = { limit ->
+                                            historyLimit = limit
+                                            saveHistoryLimit(limit)
                                         },
-                                        onLineSpacingChange = { s ->
-                                            lineSpacing = s
-                                            saveLineSpacing(s)
-                                        },
-                                        onTempUnhideToggle = { 
-                                            isTempUnhideEnabled = !isTempUnhideEnabled 
-                                        },
-                                        onTargetClick = { target -> forwardIntent(intent, target) },
                                         onPinToggle = { target ->
                                             val compStr = target.componentName.flattenToString()
                                             val newPinned = pinnedSet.toMutableSet()
@@ -249,32 +383,42 @@ class MainActivity : ComponentActivity() {
                                             newHidden.add(compStr)
                                             saveHiddenComponents(newHidden)
                                             hiddenSet = newHidden
-                                        },
-                                        onConfigImported = onConfigImported
+                                        }
                                     )
+                                } else {
+                                    HistoryScreen(historyManager)
                                 }
                             }
-                        } else {
-                            MainScreen(
-                                hiddenSet = hiddenSet,
-                                pinnedSet = pinnedSet,
-                                pinnedOrder = pinnedOrder,
-                                columnCount = columnCount,
-                                showAppName = showAppName,
-                                fontSize = fontSize,
-                                lineSpacing = lineSpacing,
-                                onUnhide = { compStr ->
-                                    val newHidden = hiddenSet.toMutableSet()
-                                    newHidden.remove(compStr)
-                                    saveHiddenComponents(newHidden)
-                                    hiddenSet = newHidden
-                                },
-                                onPinnedOrderChange = { newList ->
-                                    savePinnedOrder(newList)
-                                    pinnedOrder = newList
-                                },
-                                onConfigImported = onConfigImported
-                            )
+                        }
+
+                        if (showSettingsSheet) {
+                            ModalBottomSheet(
+                                onDismissRequest = { showSettingsSheet = false },
+                                containerColor = MaterialTheme.colorScheme.surface
+                            ) {
+                                SettingsPanel(
+                                    historyLimit = historyLimit,
+                                    onHistoryLimitChange = { limit ->
+                                        historyLimit = limit
+                                        saveHistoryLimit(limit)
+                                    },
+                                    onImport = {
+                                        val config = parseConfigFromClipboard()
+                                        if (config != null) {
+                                            applyConfig(config) { newOrder, newHidden ->
+                                                onConfigImported(newOrder, newHidden)
+                                            }
+                                            showSettingsSheet = false
+                                        } else {
+                                            Toast.makeText(this@MainActivity, "剪贴板中没有有效的配置信息", Toast.LENGTH_SHORT).show()
+                                        }
+                                    },
+                                    onExport = {
+                                        exportConfigToClipboard(pinnedOrder, hiddenSet)
+                                        showSettingsSheet = false
+                                    }
+                                )
+                            }
                         }
                     }
                 }
@@ -378,7 +522,10 @@ class MainActivity : ComponentActivity() {
     private fun getLineSpacing(): Float = prefs.getFloat("line_spacing", 10f)
     private fun saveLineSpacing(spacing: Float) = prefs.edit().putFloat("line_spacing", spacing).apply()
 
-    private fun recordUsage(target: AppTarget) {
+    private fun getHistoryLimit(): Int = prefs.getInt("history_limit", 50)
+    private fun saveHistoryLimit(limit: Int) = prefs.edit().putInt("history_limit", limit).apply()
+
+    fun recordUsage(target: AppTarget) {
         val compStr = target.componentName.flattenToString()
         prefs.edit().putString("last_used_app", compStr).apply()
         val count = prefs.getInt("usage_count_$compStr", 0)
@@ -691,10 +838,11 @@ fun ShareTargetScreen(
                 style = MaterialTheme.typography.titleLarge,
                 modifier = Modifier.weight(1f)
             )
-            TextButton(onClick = onTempUnhideToggle) {
-                Text(
-                    text = if (isTempUnhideEnabled) "隐藏已忽略" else "显示已隐藏",
-                    color = if (isTempUnhideEnabled) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurfaceVariant
+            IconButton(onClick = onTempUnhideToggle) {
+                Icon(
+                    imageVector = if (isTempUnhideEnabled) Icons.Default.VisibilityOff else Icons.Default.Visibility,
+                    contentDescription = if (isTempUnhideEnabled) "隐藏已忽略" else "显示已隐藏",
+                    tint = if (isTempUnhideEnabled) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurfaceVariant
                 )
             }
             IconButton(onClick = { showSettings = !showSettings }) {
@@ -775,7 +923,7 @@ fun ShareTargetScreen(
                     }
 
                     Spacer(modifier = Modifier.height(8.dp))
-                    Divider(color = MaterialTheme.colorScheme.outlineVariant)
+                    HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant)
                     Spacer(modifier = Modifier.height(8.dp))
 
                     Row(
@@ -812,13 +960,11 @@ fun ShareTargetScreen(
             onValueChange = { searchQuery = it },
             modifier = Modifier
                 .fillMaxWidth()
-                .padding(start = 16.dp, end = 16.dp, top = 2.dp, bottom = 12.dp),
-            placeholder = { Text("搜索应用名称...") },
-            leadingIcon = {
-                Icon(Icons.Default.Search, contentDescription = "Search Icon")
-            },
+                .padding(16.dp),
+            placeholder = { Text("搜索应用 (名称/包名/拼音首字母)") },
+            leadingIcon = { Icon(Icons.Default.Search, contentDescription = null) },
             singleLine = true,
-            shape = MaterialTheme.shapes.large
+            shape = MaterialTheme.shapes.medium
         )
 
         LazyVerticalGrid(
@@ -967,9 +1113,10 @@ fun AppTargetGridItem(
     }
 }
 
-@OptIn(ExperimentalMaterial3Api::class)
+@OptIn(ExperimentalMaterial3Api::class, ExperimentalFoundationApi::class)
 @Composable
 fun MainScreen(
+    rawApps: List<AppTarget>,
     hiddenSet: Set<String>,
     pinnedSet: Set<String>,
     pinnedOrder: List<String>,
@@ -977,181 +1124,83 @@ fun MainScreen(
     showAppName: Boolean,
     fontSize: Float,
     lineSpacing: Float,
+    historyLimit: Int,
     onUnhide: (String) -> Unit,
     onPinnedOrderChange: (List<String>) -> Unit,
-    onConfigImported: (List<String>, Set<String>) -> Unit
+    onConfigImported: (List<String>, Set<String>) -> Unit,
+    onHistoryLimitChange: (Int) -> Unit,
+    onPinToggle: (AppTarget) -> Unit,
+    onHide: (AppTarget) -> Unit
 ) {
-    val context = LocalContext.current
-    val mainActivity = remember(context) {
-        var currentContext = context
-        while (currentContext is ContextWrapper) {
-            if (currentContext is MainActivity) break
-            currentContext = currentContext.baseContext
+    Column(modifier = Modifier.fillMaxSize()) {
+        val scope = rememberCoroutineScope()
+        var searchQuery by remember { mutableStateOf("") }
+        var showHiddenDialog by remember { mutableStateOf(false) }
+        val lazyGridState = rememberLazyGridState()
+        
+        val context = LocalContext.current
+        val mainActivity = remember(context) { context.findActivity() as MainActivity }
+
+        val appsWithPinState = remember(rawApps, pinnedSet) {
+            rawApps.map { it.copy(isPinned = pinnedSet.contains(it.componentName.flattenToString())) }
         }
-        currentContext as MainActivity
-    }
 
-    // 1. Synchronous cache load for the settings screen
-    var rawApps by remember {
-        val cached = mainActivity.getCachedTargets()
-        mutableStateOf<List<AppTarget>>(cached ?: emptyList())
-    }
+        val hiddenApps = remember(appsWithPinState, hiddenSet) {
+            appsWithPinState.filter { hiddenSet.contains(it.componentName.flattenToString()) }.sortedBy { it.name }
+        }
 
-    // 2. Background sync
-    LaunchedEffect(Unit) {
-        withContext(Dispatchers.IO) {
-            val realApps = mainActivity.fetchSystemTargets()
-            val realCompStr = realApps.map { it.componentName.flattenToString() }.toSet()
-            val cachedCompStr = rawApps.map { it.componentName.flattenToString() }.toSet()
+        var mutablePinnedApps by remember(appsWithPinState, pinnedSet, pinnedOrder, hiddenSet) {
+            mutableStateOf(
+                appsWithPinState.filter { it.isPinned && !hiddenSet.contains(it.componentName.flattenToString()) }
+                       .sortedWith { a, b ->
+                           val aComp = a.componentName.flattenToString()
+                           val bComp = b.componentName.flattenToString()
+                           val aIndex = pinnedOrder.indexOf(aComp).let { if (it == -1) Int.MAX_VALUE else it }
+                           val bIndex = pinnedOrder.indexOf(bComp).let { if (it == -1) Int.MAX_VALUE else it }
+                           if (aIndex != bIndex) aIndex.compareTo(bIndex) else a.name.compareTo(b.name)
+                       }
+            )
+        }
+
+        val normalApps = remember(appsWithPinState, pinnedSet, hiddenSet) {
+            val prefs = mainActivity.getSharedPreferences("ShareRouterPrefs", Context.MODE_PRIVATE)
+            val lastUsedApp = prefs.getString("last_used_app", "") ?: ""
             
-            if (realCompStr != cachedCompStr) {
-                mainActivity.saveTargetsToCache(realApps)
-                withContext(Dispatchers.Main) {
-                    rawApps = realApps
-                }
-            }
-        }
-    }
-
-    val appsWithPinState = remember(rawApps, pinnedSet) {
-        rawApps.map { it.copy(isPinned = pinnedSet.contains(it.componentName.flattenToString())) }
-    }
-
-    val hiddenApps = remember(appsWithPinState, hiddenSet) {
-        appsWithPinState.filter { hiddenSet.contains(it.componentName.flattenToString()) }.sortedBy { it.name }
-    }
-
-    var mutablePinnedApps by remember(appsWithPinState, pinnedSet, pinnedOrder, hiddenSet) {
-        mutableStateOf(
-            appsWithPinState.filter { it.isPinned && !hiddenSet.contains(it.componentName.flattenToString()) }
+            appsWithPinState.filter { !it.isPinned && !hiddenSet.contains(it.componentName.flattenToString()) }
                    .sortedWith { a, b ->
                        val aComp = a.componentName.flattenToString()
                        val bComp = b.componentName.flattenToString()
-                       val aIndex = pinnedOrder.indexOf(aComp).let { if (it == -1) Int.MAX_VALUE else it }
-                       val bIndex = pinnedOrder.indexOf(bComp).let { if (it == -1) Int.MAX_VALUE else it }
-                       if (aIndex != bIndex) aIndex.compareTo(bIndex) else a.name.compareTo(b.name)
-                   }
-        )
-    }
-
-    val normalApps = remember(appsWithPinState, pinnedSet, hiddenSet) {
-        val prefs = mainActivity.getSharedPreferences("ShareRouterPrefs", Context.MODE_PRIVATE)
-        val lastUsedApp = prefs.getString("last_used_app", "") ?: ""
-        
-        appsWithPinState.filter { !it.isPinned && !hiddenSet.contains(it.componentName.flattenToString()) }
-               .sortedWith { a, b ->
-                   val aComp = a.componentName.flattenToString()
-                   val bComp = b.componentName.flattenToString()
-                   val aIsLastUsed = aComp == lastUsedApp
-                   val bIsLastUsed = bComp == lastUsedApp
-                   if (aIsLastUsed != bIsLastUsed) {
-                       if (aIsLastUsed) -1 else 1
-                   } else {
-                       val aCount = prefs.getInt("usage_count_$aComp", 0)
-                       val bCount = prefs.getInt("usage_count_$bComp", 0)
-                       if (aCount != bCount) {
-                           bCount.compareTo(aCount)
+                       val aIsLastUsed = aComp == lastUsedApp
+                       val bIsLastUsed = bComp == lastUsedApp
+                       if (aIsLastUsed != bIsLastUsed) {
+                           if (aIsLastUsed) -1 else 1
                        } else {
-                           a.name.compareTo(b.name)
+                           val aCount = prefs.getInt("usage_count_$aComp", 0)
+                           val bCount = prefs.getInt("usage_count_$bComp", 0)
+                           if (aCount != bCount) {
+                               bCount.compareTo(aCount)
+                           } else {
+                               a.name.compareTo(b.name)
+                           }
                        }
                    }
-               }
-    }
+        }
 
-    val lazyGridState = rememberLazyGridState()
-    
-    val reorderableState = rememberReorderableLazyGridState(lazyGridState) { from, to ->
-        val fromKey = from.key.toString()
-        val toKey = to.key.toString()
+        val reorderableState = rememberReorderableLazyGridState(lazyGridState) { from, to ->
+            val fromKey = from.key.toString()
+            val toKey = to.key.toString()
 
-        if (fromKey.startsWith("pinned_") && toKey.startsWith("pinned_")) {
-            val fromIndex = mutablePinnedApps.indexOfFirst { "pinned_" + it.componentName.flattenToString() == fromKey }
-            val toIndex = mutablePinnedApps.indexOfFirst { "pinned_" + it.componentName.flattenToString() == toKey }
-            if (fromIndex != -1 && toIndex != -1) {
-                mutablePinnedApps = mutablePinnedApps.toMutableList().also { 
-                    it.add(toIndex, it.removeAt(fromIndex)) 
+            if (fromKey.startsWith("pinned_") && toKey.startsWith("pinned_")) {
+                val fromIndex = mutablePinnedApps.indexOfFirst { "pinned_" + it.componentName.flattenToString() == fromKey }
+                val toIndex = mutablePinnedApps.indexOfFirst { "pinned_" + it.componentName.flattenToString() == toKey }
+                if (fromIndex != -1 && toIndex != -1) {
+                    mutablePinnedApps = mutablePinnedApps.toMutableList().also { 
+                        it.add(toIndex, it.removeAt(fromIndex)) 
+                    }
+                    onPinnedOrderChange(mutablePinnedApps.map { it.componentName.flattenToString() })
                 }
-                onPinnedOrderChange(mutablePinnedApps.map { it.componentName.flattenToString() })
             }
         }
-    }
-
-    Column(modifier = Modifier.fillMaxSize()) {
-        TopAppBar(
-            title = { Text("ShareRouter 设置") },
-            actions = {
-                val scope = rememberCoroutineScope()
-                IconButton(onClick = {
-                    mainActivity.exportConfigToClipboard(pinnedOrder, hiddenSet)
-                }) {
-                    Icon(Icons.Default.Share, contentDescription = "导出配置")
-                }
-
-                var showImportConfirm by remember { mutableStateOf(false) }
-                var pendingConfig by remember { mutableStateOf<JSONObject?>(null) }
-                
-                IconButton(onClick = {
-                    val config = mainActivity.parseConfigFromClipboard()
-                    if (config != null) {
-                        pendingConfig = config
-                        showImportConfirm = true
-                    } else {
-                        Toast.makeText(context, "剪贴板中没有有效的配置信息", Toast.LENGTH_SHORT).show()
-                    }
-                }) {
-                    Icon(Icons.Default.Add, contentDescription = "导入配置")
-                }
-
-                if (showImportConfirm && pendingConfig != null) {
-                    AlertDialog(
-                        onDismissRequest = { showImportConfirm = false },
-                        title = { Text("确认导入配置？") },
-                        text = { Text("导入配置将完全替换您当前的置顶顺序和隐藏应用列表，此操作不可撤销。") },
-                        confirmButton = {
-                            TextButton(onClick = {
-                                mainActivity.applyConfig(pendingConfig!!) { newOrder, newHidden ->
-                                    onConfigImported(newOrder, newHidden)
-                                }
-                                showImportConfirm = false
-                            }) {
-                                Text("确认导入", color = MaterialTheme.colorScheme.error)
-                            }
-                        },
-                        dismissButton = {
-                            TextButton(onClick = { showImportConfirm = false }) {
-                                Text("取消")
-                            }
-                        }
-                    )
-                }
-
-                IconButton(onClick = {
-                    scope.launch(Dispatchers.IO) {
-                        mainActivity.clearPinyinCache()
-                        val realApps = mainActivity.fetchSystemTargets()
-                        mainActivity.saveTargetsToCache(realApps)
-                        
-                        // 从 SharedPreferences 重新加载最新的配置（处理多实例同步问题）
-                        val latestPinned = mainActivity.getPinnedComponents()
-                        val latestHidden = mainActivity.getHiddenComponents()
-                        val latestOrder = mainActivity.getPinnedOrder()
-
-                        withContext(Dispatchers.Main) {
-                            rawApps = realApps
-                            // 通过导入回调更新父作用域的状态变量
-                            onConfigImported(latestOrder, latestHidden)
-                            Toast.makeText(context, "列表与配置已同步刷新", Toast.LENGTH_SHORT).show()
-                        }
-                    }
-                }) {
-                    Icon(Icons.Default.Refresh, contentDescription = "刷新列表")
-                }
-            },
-            colors = TopAppBarDefaults.topAppBarColors(
-                containerColor = MaterialTheme.colorScheme.primaryContainer,
-                titleContentColor = MaterialTheme.colorScheme.onPrimaryContainer
-            )
-        )
 
         LazyVerticalGrid(
             columns = GridCells.Fixed(columnCount),
@@ -1175,9 +1224,11 @@ fun MainScreen(
                             target = app,
                             showAppName = showAppName,
                             fontSize = fontSize,
-                            showMenuEnabled = false,
+                            showMenuEnabled = true,
                             isDragging = isDragging,
-                            dragModifier = Modifier.longPressDraggableHandle()
+                            dragModifier = Modifier.longPressDraggableHandle(),
+                            onPinToggle = { onPinToggle(app) },
+                            onHide = { onHide(app) }
                         )
                     }
                 }
@@ -1187,7 +1238,7 @@ fun MainScreen(
             if (normalApps.isNotEmpty()) {
                 item(span = { GridItemSpan(maxLineSpan) }) {
                     Text(
-                        text = "常规应用 (按使用频次智能排序)",
+                        text = "常规应用 (长按隐藏或者置顶)",
                         style = MaterialTheme.typography.titleMedium,
                         color = MaterialTheme.colorScheme.primary,
                         modifier = Modifier.padding(vertical = 12.dp)
@@ -1198,7 +1249,9 @@ fun MainScreen(
                         target = app,
                         showAppName = showAppName,
                         fontSize = fontSize,
-                        showMenuEnabled = false
+                        showMenuEnabled = true,
+                        onPinToggle = { onPinToggle(app) },
+                        onHide = { onHide(app) }
                     )
                 }
             }
@@ -1207,7 +1260,7 @@ fun MainScreen(
             if (hiddenApps.isNotEmpty()) {
                 item(span = { GridItemSpan(maxLineSpan) }) {
                     Text(
-                        text = "已隐藏的应用",
+                        text = "已隐藏的应用 (长按取消隐藏)",
                         style = MaterialTheme.typography.titleMedium,
                         color = MaterialTheme.colorScheme.error,
                         modifier = Modifier.padding(vertical = 12.dp)
@@ -1226,7 +1279,13 @@ fun MainScreen(
                     }
                     Column(
                         horizontalAlignment = Alignment.CenterHorizontally,
-                        modifier = Modifier.fillMaxWidth().padding(vertical = 0.dp, horizontal = 2.dp)
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .combinedClickable(
+                                onClick = { },
+                                onLongClick = { onUnhide(app.componentName.flattenToString()) }
+                            )
+                            .padding(vertical = 0.dp, horizontal = 2.dp)
                     ) {
                         if (iconBitmap != null) {
                             Image(
@@ -1259,11 +1318,193 @@ fun MainScreen(
                                 )
                             )
                         }
-                        TextButton(onClick = { onUnhide(app.componentName.flattenToString()) }) {
-                            Text("取消隐藏", fontSize = 12.sp)
+                    }
+                }
+            }
+        }
+    }
+}
+
+@Composable
+fun HistoryScreen(manager: HistoryManager) {
+    val context = LocalContext.current
+    val db = remember { ShareDatabase.getDatabase(context) }
+    val historyList by db.historyDao().getAllHistory().collectAsState(initial = emptyList())
+    val scope = rememberCoroutineScope()
+
+    LazyColumn(
+        modifier = Modifier.fillMaxSize().padding(16.dp),
+        verticalArrangement = Arrangement.spacedBy(12.dp)
+    ) {
+        if (historyList.isEmpty()) {
+            item {
+                Box(modifier = Modifier.fillParentMaxSize(), contentAlignment = Alignment.Center) {
+                    Text("暂无分享历史", color = MaterialTheme.colorScheme.onSurfaceVariant)
+                }
+            }
+        }
+
+        lazyItems(historyList, key = { it.id }) { entry ->
+            Card(
+                modifier = Modifier.fillMaxWidth(),
+                colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.5f))
+            ) {
+                Column(modifier = Modifier.padding(12.dp)) {
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Text(
+                            text = when (entry.type) {
+                                "TEXT" -> "📝 文本"
+                                "IMAGE" -> "🖼️ 图片"
+                                "VIDEO" -> "🎬 视频"
+                                "MULTIPLE" -> "📚 多文件"
+                                else -> "📄 文件"
+                            },
+                            style = MaterialTheme.typography.labelLarge,
+                            color = MaterialTheme.colorScheme.primary
+                        )
+                        
+                        if (!entry.sourceApp.isNullOrBlank()) {
+                            Text(
+                                text = " · 来自: ${entry.sourceApp}",
+                                style = MaterialTheme.typography.labelSmall,
+                                color = MaterialTheme.colorScheme.secondary,
+                                modifier = Modifier.padding(start = 4.dp)
+                            )
+                        }
+
+                        Spacer(modifier = Modifier.weight(1f))
+                        Text(
+                            text = java.text.SimpleDateFormat("MM-dd HH:mm", java.util.Locale.getDefault()).format(java.util.Date(entry.timestamp)),
+                            style = MaterialTheme.typography.labelSmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                    }
+                    
+                    if (!entry.contentText.isNullOrBlank()) {
+                        Spacer(modifier = Modifier.height(6.dp))
+                        Text(
+                            text = entry.contentText,
+                            maxLines = 2,
+                            overflow = TextOverflow.Ellipsis,
+                            style = MaterialTheme.typography.bodyMedium
+                        )
+                    }
+
+                    val names = entry.attachmentNames?.split(",")?.filter { it.isNotBlank() } ?: emptyList()
+                    if (names.isNotEmpty()) {
+                        Spacer(modifier = Modifier.height(8.dp))
+                        Column(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .background(MaterialTheme.colorScheme.surface.copy(alpha = 0.3f), MaterialTheme.shapes.small)
+                                .padding(8.dp)
+                        ) {
+                            names.forEach { name ->
+                                Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.padding(vertical = 2.dp)) {
+                                    Icon(Icons.Default.Share, contentDescription = null, modifier = Modifier.size(10.dp), tint = MaterialTheme.colorScheme.secondary)
+                                    Spacer(Modifier.width(6.dp))
+                                    Text(
+                                        text = name,
+                                        style = MaterialTheme.typography.bodySmall,
+                                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                        maxLines = 1,
+                                        overflow = TextOverflow.Ellipsis
+                                    )
+                                }
+                            }
+                            if (!entry.mimeType.isNullOrBlank()) {
+                                Text(
+                                    text = "MIME: ${entry.mimeType}",
+                                    style = MaterialTheme.typography.labelSmall.copy(fontSize = 10.sp),
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.5f),
+                                    modifier = Modifier.padding(top = 4.dp)
+                                )
+                            }
+                        }
+                    }
+
+                    Spacer(modifier = Modifier.height(12.dp))
+                    Row {
+                        Button(
+                            onClick = {
+                                val intent = manager.createDispatchIntent(entry)
+                                context.startActivity(Intent.createChooser(intent, "重新分发分享"))
+                            },
+                            modifier = Modifier.weight(1f),
+                            shape = MaterialTheme.shapes.medium
+                        ) {
+                            Text("重新分发", fontSize = 12.sp)
+                        }
+                        Spacer(modifier = Modifier.width(8.dp))
+                        OutlinedButton(
+                            onClick = {
+                                scope.launch {
+                                    db.historyDao().delete(entry)
+                                }
+                            },
+                            shape = MaterialTheme.shapes.medium
+                        ) {
+                            Text("删除", fontSize = 12.sp)
                         }
                     }
                 }
+            }
+        }
+    }
+}
+
+@Composable
+fun SettingsPanel(
+    historyLimit: Int,
+    onHistoryLimitChange: (Int) -> Unit,
+    onImport: () -> Unit,
+    onExport: () -> Unit
+) {
+    Column(
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(16.dp)
+            .padding(bottom = 32.dp)
+    ) {
+        Text("通用设置", style = MaterialTheme.typography.titleLarge, modifier = Modifier.padding(bottom = 16.dp))
+        
+        Card(
+            modifier = Modifier.fillMaxWidth(),
+            colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.5f))
+        ) {
+            Column(modifier = Modifier.padding(16.dp)) {
+                Text("历史保存容量: $historyLimit", style = MaterialTheme.typography.titleMedium)
+                Slider(
+                    value = historyLimit.toFloat(),
+                    onValueChange = { onHistoryLimitChange(it.toInt()) },
+                    valueRange = 10f..200f,
+                    steps = 18
+                )
+                Text("超过此限制的分享记录将被自动删除", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+            }
+        }
+        
+        Spacer(modifier = Modifier.height(16.dp))
+        
+        Row(modifier = Modifier.fillMaxWidth()) {
+            Button(
+                onClick = onImport,
+                modifier = Modifier.weight(1f),
+                colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.secondaryContainer, contentColor = MaterialTheme.colorScheme.onSecondaryContainer)
+            ) {
+                Icon(Icons.Default.Add, contentDescription = null)
+                Spacer(modifier = Modifier.width(8.dp))
+                Text("导入配置")
+            }
+            Spacer(modifier = Modifier.width(16.dp))
+            Button(
+                onClick = onExport,
+                modifier = Modifier.weight(1f),
+                colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.secondaryContainer, contentColor = MaterialTheme.colorScheme.onSecondaryContainer)
+            ) {
+                Icon(Icons.Default.Share, contentDescription = null)
+                Spacer(modifier = Modifier.width(8.dp))
+                Text("导出配置")
             }
         }
     }

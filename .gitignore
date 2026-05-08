@@ -1,15 +1,46 @@
-*.iml
-.gradle
-/local.properties
-/.idea/caches
-/.idea/libraries
-/.idea/modules.xml
-/.idea/workspace.xml
-/.idea/navEditor.xml
-/.idea/assetWizardSettings.xml
-.DS_Store
-/build
-/captures
-.externalNativeBuild
-.cxx
+# Android
+build/
+bin/
+gen/
+out/
+.gradle/
 local.properties
+.externalNativeBuild/
+.cxx/
+captures/
+*.apk
+*.ap_
+*.dex
+*.class
+
+# IDE - Android Studio / IntelliJ
+.idea/
+*.iml
+*.iws
+*.ipr
+/out/
+.idea/caches/
+.idea/libraries/
+.idea/modules.xml
+.idea/workspace.xml
+.idea/navEditor.xml
+.idea/assetWizardSettings.xml
+
+# Gradle
+.gradle/
+build/
+
+# Reference Source Code (Custom)
+/参考源码/
+
+# System files
+.DS_Store
+Thumbs.db
+
+# Share History (Runtime data)
+app/src/main/assets/share_history/
+/share_history/
+# External / Temp
+/AppManager/
+/分享管理*/
+*.apk
