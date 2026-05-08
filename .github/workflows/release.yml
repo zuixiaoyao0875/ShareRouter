@@ -3,7 +3,7 @@ name: Android Release CI
 on:
   push:
     tags:
-      - 'v*' # 当你推送以 v 开头的标签时触发，如 v1.1.0
+      - 'v*'
 
 jobs:
   build:
@@ -21,6 +21,19 @@ jobs:
           distribution: 'temurin'
           cache: gradle
 
+      # 从 GitHub Secrets 中还原 .jks 文件
+      - name: Decode Keystore
+        run: |
+          echo "${{ secrets.SIGNING_KEY }}" | base64 --decode > sharerouter.jks
+
+      # 动态生成 keystore.properties 供 Gradle 读取
+      - name: Generate Keystore Properties
+        run: |
+          echo "storeFile=sharerouter.jks" > keystore.properties
+          echo "storePassword=${{ secrets.STORE_PASSWORD }}" >> keystore.properties
+          echo "keyAlias=${{ secrets.KEY_ALIAS }}" >> keystore.properties
+          echo "keyPassword=${{ secrets.KEY_PASSWORD }}" >> keystore.properties
+
       - name: Grant execute permission for gradlew
         run: chmod +x gradlew
 
@@ -33,12 +46,12 @@ jobs:
           files: app/build/outputs/apk/release/app-release.apk
           name: ShareRouter Release ${{ github.ref_name }}
           body: |
-            ## 🚀 ShareRouter 自动发布
+            ## 🚀 ShareRouter 正式版自动发布
             版本：${{ github.ref_name }}
             
-            ### 更新日志
-            - 自动编译构建
-            - 包含最新的历史记录增强与 UI 优化功能
+            ### 变更日志
+            - 启用正式签名与 R8 优化
+            - 自动构建流程已升级
           draft: false
           prerelease: false
         env:

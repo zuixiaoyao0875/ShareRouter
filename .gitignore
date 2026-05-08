@@ -46,3 +46,7 @@ app/src/main/assets/share_history/
 *.apk
 todo.md
 shareroute.png
+
+# Keystore & Secrets
+*.jks
+keystore.properties
