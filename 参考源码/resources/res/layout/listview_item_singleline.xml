@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="utf-8"?>
+<TextView xmlns:android="http://schemas.android.com/apk/res/android"
+    android:textAppearance="?android:attr/textAppearanceListItemSmall"
+    android:textSize="16sp"
+    android:textColor="?android:attr/textColorAlertDialogListItem"
+    android:ellipsize="end"
+    android:gravity="center_vertical"
+    android:id="@+id/label"
+    android:layout_width="match_parent"
+    android:layout_height="wrap_content"
+    android:divider="?android:attr/listDivider"
+    android:minHeight="48dp"
+    android:singleLine="true"
+    android:layout_centerVertical="true"
+    android:layout_alignWithParentIfMissing="true"
+    android:paddingStart="24dp"
+    android:paddingEnd="24dp"
+    style="@style/TextAppearance.AppCompat.Body1"/>

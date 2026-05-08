@@ -1,0 +1,24 @@
+<?xml version="1.0" encoding="utf-8"?>
+<menu xmlns:android="http://schemas.android.com/apk/res/android">
+    <group android:id="@+id/group1">
+        <item
+            android:id="@+id/choose_theme"
+            android:title="选择主题"/>
+        <item
+            android:id="@+id/toggle_grid_list"
+            android:title="切换网格/列表"/>
+    </group>
+    <group android:id="@+id/group2">
+        <item
+            android:id="@+id/unhide_all"
+            android:title="取消隐藏"/>
+        <item
+            android:id="@+id/clear_defaults"
+            android:title="清除默认值"/>
+    </group>
+    <group android:id="@+id/group3">
+        <item
+            android:id="@+id/send_feedback"
+            android:title="发送反馈"/>
+    </group>
+</menu>
