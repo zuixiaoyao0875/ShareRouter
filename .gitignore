@@ -50,3 +50,5 @@ shareroute.png
 # Keystore & Secrets
 *.jks
 keystore.properties
+app/release/
+分享管理*
